@@ -2,11 +2,11 @@ import pickle
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from pytorch_transformers import *
+# from pytorch_transformers import *
 import torch.utils.data as Data
 
-def get_data(data_path, max_seq_len, model = 'xlnet-base-cased'):
-    tokenizer = XLNetTokenizer.from_pretrained(model)
+def get_data(data_path, max_seq_len, tokenizer):
+    # tokenizer = XLNetTokenizer.from_pretrained(model)
 
     with open(data_path + 'labeled_data.pkl', 'rb') as f:
         labeled_data = pickle.load(f)
@@ -57,23 +57,31 @@ class loader_labeled(Dataset):
         length = len(tokens)
         
         encode_result = self.tokenizer.convert_tokens_to_ids(tokens)
+        input_mask = [1] * len(encode_result)
+        segment_ids = [1] * len(encode_result)
         padding = [0] * (self.max_seq_len - len(encode_result))
-        encode_result += padding
 
-        return encode_result
+        encode_result += padding
+        input_mask += padding
+        segment_ids += padding
+
+        return encode_result, input_mask, segment_ids
     
     def __getitem__(self, idx):
         sent_id = self.ids[idx]
         text = self.data[sent_id][1]
         l = self.data[sent_id][2]
-        encode_result = self.get_tokenized(text)
+        encode_result, input_mask, segment_ids = self.get_tokenized(text)
 
         labels = [0,0,0,0,0,0]
 
         for i in range(0, len(l)):
             labels[l[i]] = 1
         
-        return (torch.tensor(encode_result), labels)
+        # return (torch.tensor(encode_result), labels)
+        return (torch.tensor(encode_result), torch.tensor(input_mask), \
+               torch.tensor(segment_ids)), torch.tensor(labels)
+
 
 
 
