@@ -7,12 +7,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data as Data
-# from pytorch_transformers import *
+from pytorch_transformers import *
 from torch.autograd import Variable
 from torch.utils.data import Dataset
 import logging
 from read_data import *
-# from model import ClassificationXLNet
+from model import ClassificationXLNet
 from utils import ALL_MODELS, ID2CLASS, MODEL_CLASSES
 from transformers import AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm, trange
@@ -27,7 +27,7 @@ parser.add_argument('--batch_size_u', default=24, type=int, metavar='N',
                     help='train batchsize')
 
 parser.add_argument('--max_seq_length', default=64, type=int, metavar='N',
-                    help='max sequence length')                 
+                    help='max sequence length')
 
 parser.add_argument('--lrmain', '--learning-rate-bert', default=0.00001, type=float,
                     metavar='LR', help='initial learning rate for bert')
@@ -38,10 +38,10 @@ parser.add_argument('--gpu', default='0,1,2,3', type=str,
                     help='id(s) for CUDA_VISIBLE_DEVICES')
 parser.add_argument('--output_dir', default="test_model", type=str,
                     help='path to trained model and eval and test results')
-parser.add_argument("--model_type", default=None, type=str, required=True,
-                    help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
-parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
-                    help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS))
+# parser.add_argument("--model_type", default=None, type=str, required=True,
+#                     help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
+# parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
+#                     help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS))
 parser.add_argument('--data-path', type=str, default='./processed_data/',
                     help='path to data folders')
 parser.add_argument("--do_lower_case", action='store_true',
@@ -50,7 +50,10 @@ parser.add_argument("--weight_decay", default=0.0, type=float,
                     help="Weight deay if we apply some.")
 parser.add_argument("--adam_epsilon", default=1e-8, type=float,
                     help="Epsilon for Adam optimizer.")
-
+parser.add_argument('--average', type=str, default='pos_label',
+                    help='pos_label or macor for 0/1 classes')
+parser.add_argument("--warmup_steps", default=100, type=int,
+                        help="Linear warmup over warmup_steps.")
 args = parser.parse_args()
 
 
@@ -58,7 +61,8 @@ os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 n_gpu = torch.cuda.device_count()
-print("gpu num: ", n_gpu)
+args.n_gpu = n_gpu
+logger.info("Training/evaluation parameters %s", args)
 
 best_f1 = 0
 
@@ -74,8 +78,9 @@ def print_score(output_scores, n_labels):
 def main():
     global best_f1
 
-    config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
+    # config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    # tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
+    tokenizer = XLNetTokenizer.from_pretrained("xlnet-base-cased")
 
     train_labeled_set, val_set, test_set, n_labels = get_data(args.data_path, args.max_seq_length, tokenizer)
     labeled_trainloader = Data.DataLoader(
@@ -95,28 +100,27 @@ def main():
                         datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.INFO)
     logger.warning("Device: %s, n_gpu: %s", device, args.n_gpu)
-
-    config = config_class.from_pretrained(args.model_name_or_path, num_labels=n_labels)
-    model = model_class.from_pretrained(args.model_name_or_path, config=config)
-    # model = ClassificationXLNet(n_labels).cuda()
+    # config = config_class.from_pretrained(args.model_name_or_path, num_labels=2)
+    # model = model_class.from_pretrained(args.model_name_or_path, config=config)
+    model = ClassificationXLNet(n_labels).cuda()
     model.to(device)
 
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
 
-    # optimizer = AdamW(
-    # [
-    #     {"params": model.module.xlnet.parameters(), "lr": args.lrmain},
-    #     {"params": model.module.linear.parameters(), "lr": args.lrlast},
-    # ])
+    optimizer = AdamW(
+    [
+        {"params": model.module.xlnet.parameters(), "lr": args.lrmain},
+        {"params": model.module.linear.parameters(), "lr": args.lrlast},
+    ])
     # Prepare optimizer and schedule (linear warmup and decay)
-    no_decay = ['bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-         'weight_decay': args.weight_decay},
-        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-    ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.lrmain, eps=args.adam_epsilon)
+    # no_decay = ['bias', 'LayerNorm.weight']
+    # optimizer_grouped_parameters = [
+    #     {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+    #      'weight_decay': args.weight_decay},
+    #     {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    # ]
+    # optimizer = AdamW(optimizer_grouped_parameters, lr=args.lrmain, eps=args.adam_epsilon)
     # scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
     #                                             num_training_steps=len(train_labeled_set))
 
@@ -128,8 +132,8 @@ def main():
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(labeled_trainloader))
     logger.info("  Num Epochs = %d", args.epochs)
-    logger.info("  Model = %s" % str(args.model_name_or_path))
-    logger.info("  Lower case = %s" % str(args.do_lower_case))
+    # logger.info("  Model = %s" % str(args.model_name_or_path))
+    # logger.info("  Lower case = %s" % str(args.do_lower_case))
     logger.info("  Batch size = %d" % args.batch_size)
     logger.info("  Max seq length = %d" % args.max_seq_length)
 
@@ -185,23 +189,36 @@ def main():
     logger.info('Test f1:')
     logger.info(test_f1)
 
-def train(labeled_trainloader, model, optimizer,criterion, epoch, n_labels = 6):
+def train(labeled_trainloader, model, optimizer,criterion, epoch, n_labels):
     model.train()
 
     for batch_idx, (inputs , targets) in enumerate(labeled_trainloader):
-        # inputs, targets = inputs.cuda(),targets.cuda(non_blocking=True)
-        # outputs = model(inputs)
-        batch, targets = tuple(t.to(device) for t in inputs), targets.to(device)
-        inputs = {'input_ids': batch[0],
-                  'attention_mask': batch[1],
-                  'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
-                  # XLM don't use segment_ids
-                  }
-        outputs = model(**inputs)
-        outputs = outputs[0]
+        inputs, targets = inputs.cuda(),targets.cuda(non_blocking=True)
+        outputs = model(inputs)
+        # batch, targets = tuple(t.to(device) for t in inputs), targets.to(device)
+        # inputs = {'input_ids': batch[0],
+        #           'attention_mask': batch[1],
+        #           'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
+        #           XLM don't use segment_ids
+                  # }
+        # outputs = model(**inputs)
+        # outputs = outputs[0]
+        # print("outputs: ", outputs.shape)
+        # print("targets: ", targets.shape)
         # print(len(outputs))
         # print(outputs)
         loss = criterion(outputs, targets, epoch)
+        # print("outputs: ", outputs[0])
+        # print("targets: ", targets[0])
+        # outputs = torch.sigmoid(outputs)
+        # print("o: ", outputs[0])
+        # id_1, id_0 = torch.where(outputs > 0.5), torch.where(outputs < 0.5)
+        # outputs[id_1] = 1
+        # outputs[id_0] = 0
+        # outputs = outputs.detach().cpu().numpy()
+        # targets = targets.to('cpu').numpy()
+        # print("outputs: ", outputs[:20, 0])
+        # print("targets: ", targets[:20, 0])
 
         optimizer.zero_grad()
         if batch_idx % 50 == 1:
@@ -209,6 +226,7 @@ def train(labeled_trainloader, model, optimizer,criterion, epoch, n_labels = 6):
                 epoch, batch_idx, loss.item()))
         loss.backward()
         optimizer.step()
+        # scheduler.step()
 
 def validate(val_loader, model, n_labels, mode):
     model.eval()
@@ -223,16 +241,17 @@ def validate(val_loader, model, n_labels, mode):
 
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(val_loader):
-            # inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
-            # outputs = model(inputs)
-            batch, targets = tuple(t.to(device) for t in inputs), targets.to(device)
-            inputs = {'input_ids': batch[0],
-                      'attention_mask': batch[1],
-                      'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
+            inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
+            outputs = model(inputs)
+            # batch, targets = tuple(t.to(device) for t in inputs), targets.to(device)
+            # inputs = {'input_ids': batch[0],
+            #           'attention_mask': batch[1],
+            #           'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
                       # XLM don't use segment_ids
-                      }
-            outputs = model(**inputs)
-            outputs = torch.sigmoid(outputs[0])
+                      # }
+            # outputs = model(**inputs)
+            # outputs = torch.sigmoid(outputs[0])
+            outputs = torch.sigmoid(outputs)
 
             id_1, id_0 = torch.where(outputs>0.5), torch.where(outputs<0.5)
             batch_size = outputs.shape[0]
@@ -240,6 +259,8 @@ def validate(val_loader, model, n_labels, mode):
             outputs[id_0] = 0
             outputs = outputs.detach().cpu().numpy()
             targets = targets.to('cpu').numpy()
+            # print("outputs: ", outputs[:20,0])
+            # print("targets: ", targets[:20,0])
             for b in range(batch_size):
                 for i in range(n_labels):
                     predict_dict[i][int(outputs[b, i])] += 1
@@ -251,7 +272,7 @@ def validate(val_loader, model, n_labels, mode):
     all_recall = []
     all_f1 = []
     n_class = 2
-    averaging = "macro"  # "pos_label"
+    averaging = args.average
     logger.info("averaging method: {}".format(averaging))
 
     for i in range(n_labels):

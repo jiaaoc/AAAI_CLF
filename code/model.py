@@ -9,7 +9,7 @@ class ClassificationXLNet(nn.Module):
 
         self.xlnet = XLNetModel.from_pretrained('xlnet-base-cased')
 
-        self.max_pool = nn.MaxPool1d(256)
+        self.max_pool = nn.MaxPool1d(64)
 
         self.linear = nn.Linear(768, num_labels)
 
