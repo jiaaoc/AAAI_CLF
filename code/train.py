@@ -16,6 +16,7 @@ from model import ClassificationXLNet
 from utils import ALL_MODELS, ID2CLASS, MODEL_CLASSES
 from transformers import AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm, trange
+from torch.nn import CrossEntropyLoss, MSELoss
 
 logger = logging.getLogger(__name__)
 parser = argparse.ArgumentParser(description='AAAI CLF')
@@ -34,7 +35,7 @@ parser.add_argument('--lrmain', '--learning-rate-bert', default=0.00001, type=fl
 parser.add_argument('--lrlast', '--learning-rate-model', default=0.001, type=float,
                     metavar='LR', help='initial learning rate for models')
 
-parser.add_argument('--gpu', default='0,1,2,3', type=str,
+parser.add_argument('--gpu', default='1,2,3,4', type=str,
                     help='id(s) for CUDA_VISIBLE_DEVICES')
 parser.add_argument('--output_dir', default="test_model", type=str,
                     help='path to trained model and eval and test results')
@@ -50,8 +51,8 @@ parser.add_argument("--weight_decay", default=0.0, type=float,
                     help="Weight deay if we apply some.")
 parser.add_argument("--adam_epsilon", default=1e-8, type=float,
                     help="Epsilon for Adam optimizer.")
-parser.add_argument('--average', type=str, default='pos_label',
-                    help='pos_label or macor for 0/1 classes')
+parser.add_argument('--average', type=str, default='macro',
+                    help='pos_label or macro for 0/1 classes')
 parser.add_argument("--warmup_steps", default=100, type=int,
                         help="Linear warmup over warmup_steps.")
 args = parser.parse_args()
@@ -66,18 +67,23 @@ logger.info("Training/evaluation parameters %s", args)
 
 best_f1 = 0
 
-def print_score(output_scores, n_labels):
-    for i in range(n_labels):
-        logger.info("============================")
-        logger.info("class {}".format(ID2CLASS[i]))
-        result = output_scores[i]
-        for key in sorted(result.keys()):
-            logger.info("  %s = %s", key, str(result[key]))
+
+def simple_accuracy(preds, labels):
+    return (preds == labels).mean()
+
+
+def print_score(output_scores, no_class):
+    # logger.info("============================")
+    logger.info("class {}".format(ID2CLASS[no_class]))
+    result = output_scores
+    for key in sorted(result.keys()):
+        logger.info("  %s = %s", key, str(result[key]))
 
 
 def main():
     global best_f1
-
+    if not os.path.exists(args.output_dir):
+        os.mkdir(args.output_dir)
     # config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     # tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
     tokenizer = XLNetTokenizer.from_pretrained("xlnet-base-cased")
@@ -102,8 +108,10 @@ def main():
     logger.warning("Device: %s, n_gpu: %s", device, args.n_gpu)
     # config = config_class.from_pretrained(args.model_name_or_path, num_labels=2)
     # model = model_class.from_pretrained(args.model_name_or_path, config=config)
+    n_labels = 2
+    no_class = 0
     model = ClassificationXLNet(n_labels).cuda()
-    model.to(device)
+    # model.to(device)
 
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
@@ -144,17 +152,17 @@ def main():
                                                  model, n_labels, mode='Train Stats')
 
         logger.info("******Epoch {}, train score******".format(epoch))
-        print_score(train_output_scores, n_labels)
+        print_score(train_output_scores, no_class)
         # print("epoch {}, train f1 {}".format(epoch, train_f1))
 
         val_output_scores, val_f1 = validate(val_loader,
                                              model, n_labels, mode='Valid Stats')
 
         logger.info("******Epoch {}, validation score******".format(epoch))
-        print_score(val_output_scores, n_labels)
+        print_score(val_output_scores, no_class)
         # print("epoch {}, val f1 {}".format(epoch, val_f1))
 
-        if sum(val_f1)/n_labels >= sum(best_f1)/n_labels:
+        if val_f1 >= best_f1:
             best_f1 = val_f1
             test_output_scores, test_f1 = validate(test_loader, model, n_labels, mode = 'Test')
             all_test_f1.append(test_f1)
@@ -230,19 +238,16 @@ def train(labeled_trainloader, model, optimizer,criterion, epoch, n_labels):
 
 def validate(val_loader, model, n_labels, mode):
     model.eval()
-    predict_dict = {}
-    correct_dict = {}
-    correct_total = {}
 
-    for i in range(n_labels):
-        predict_dict[i] = [0,0]
-        correct_dict[i] = [0,0]
-        correct_total[i] = [0,0]
+    predict_dict = [0,0]
+    correct_dict = [0,0]
+    correct_total = [0,0]
 
+    outputs = None
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(val_loader):
             inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
-            outputs = model(inputs)
+            logits = model(inputs)
             # batch, targets = tuple(t.to(device) for t in inputs), targets.to(device)
             # inputs = {'input_ids': batch[0],
             #           'attention_mask': batch[1],
@@ -251,64 +256,62 @@ def validate(val_loader, model, n_labels, mode):
                       # }
             # outputs = model(**inputs)
             # outputs = torch.sigmoid(outputs[0])
-            outputs = torch.sigmoid(outputs)
+            # outputs = torch.sigmoid(outputs)
+            # outputs = np.argmax(outputs, axis=1)
+            if outputs is None:
+                outputs = logits.detach().cpu().numpy()
+                out_label_ids = targets.detach().cpu().numpy()
+            else:
+                outputs = np.append(outputs, logits.detach().cpu().numpy(), axis=0)
+                out_label_ids = np.append(out_label_ids, targets.detach().cpu().numpy(), axis=0)
 
-            id_1, id_0 = torch.where(outputs>0.5), torch.where(outputs<0.5)
-            batch_size = outputs.shape[0]
-            outputs[id_1] = 1
-            outputs[id_0] = 0
-            outputs = outputs.detach().cpu().numpy()
-            targets = targets.to('cpu').numpy()
-            # print("outputs: ", outputs[:20,0])
-            # print("targets: ", targets[:20,0])
-            for b in range(batch_size):
-                for i in range(n_labels):
-                    predict_dict[i][int(outputs[b, i])] += 1
-                    correct_dict[i][int(targets[b, i])] += 1
-                    if outputs[b, i] == targets[b, i]:
-                        correct_total[i][int(outputs[b, i])] += 1
+    pred = np.argmax(outputs, axis=1)
+    batch_size = pred.shape[0]
+    for b in range(batch_size):
+        predict_dict[int(pred[b])] += 1
+        correct_dict[int(out_label_ids[b])] += 1
+        if pred[b] == out_label_ids[b]:
+            correct_total[int(pred[b])] += 1
+    acc = simple_accuracy(pred, out_label_ids)
 
-    all_precision = []
-    all_recall = []
-    all_f1 = []
     n_class = 2
     averaging = args.average
     logger.info("averaging method: {}".format(averaging))
 
-    for i in range(n_labels):
-        precision, recall, f1 = [], [], []
-        for j in range(n_class):
-            p = correct_total[i][j] / predict_dict[i][j]
-            r = correct_total[i][j] / correct_dict[i][j]
-            f = 2 * p * r / (p + r)
-            precision.append(p)
-            recall.append(r)
-            f1.append(f)
+    precision, recall, f1 = [], [], []
+    for j in range(n_class):
+        p = correct_total[j] / predict_dict[j]
+        r = correct_total[j] / correct_dict[j]
+        f = 2 * p * r / (p + r)
+        precision.append(p)
+        recall.append(r)
+        f1.append(f)
 
-        all_precision.append(precision)
-        all_recall.append(recall)
-        all_f1.append(f1)
 
-    output_scores = []
-    output_f1 = []
-    for i in range(n_labels):
-        if averaging == "pos_label":
-            p, r, f = all_precision[i][1], all_recall[i][1], all_f1[i][1]
-        elif averaging == "macro":
-            p, r, f = sum(all_precision[i])/n_class, \
-                      sum(all_recall[i])/n_class, sum(all_f1[i])/n_class
-        else:
-            raise ValueError("UnsupportedOperationException")
-        output_scores.append({"precision":p, "recall":r, "f1":f})
-        output_f1.append(f)
+    if averaging == "pos_label":
+        p, r, f = precision[1], recall[1], f1[1]
+    elif averaging == "macro":
+        p, r, f = sum(precision)/n_class, \
+                  sum(recall)/n_class, sum(f1)/n_class
+    else:
+        raise ValueError("UnsupportedOperationException")
+
+    output_scores = {"precision":p, "recall":r, "f1":f, "acc":acc}
+    output_f1 = f
 
     return output_scores, output_f1
 
 
 class SemiLoss(object):
+    def __init__(self, n_labels=2):
+        self.n_labels = n_labels
+
     def __call__(self, outputs_x, targets_x, epoch):
-        Lx = - torch.mean(torch.sum(F.logsigmoid(outputs_x) * targets_x, dim=1))
-        return Lx
+        loss_fct = CrossEntropyLoss()
+        loss = loss_fct(outputs_x.view(-1, self.n_labels), targets_x.view(-1))
+        return loss
+        # Lx = - torch.mean(torch.sum(F.logsigmoid(outputs_x) * targets_x, dim=1))
+        # return Lx
 
 if __name__ == "__main__":
     main()

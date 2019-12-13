@@ -14,11 +14,12 @@ class ClassificationXLNet(nn.Module):
         self.linear = nn.Linear(768, num_labels)
 
     def forward(self, x):
-
+        # print("x: ", x.shape)
         all_hidden, pooler = self.xlnet(x)
+        # print("allh: ", all_hidden.shape)
+
         pooled_output = self.max_pool(all_hidden.transpose(1, 2))
         pooled_output = pooled_output.squeeze(2)
 
         predict = self.linear(pooled_output)
-
         return predict
