@@ -180,7 +180,7 @@ def main():
                 writer.write("max seq length = %d\n" % args.max_seq_length)
                 logger.info("****************************")
                 logger.info("class {}".format(ID2CLASS[no_class]))
-                result = test_output_scores[no_class]
+                result = test_output_scores
                 for key in sorted(result.keys()):
                     logger.info("  %s = %s", key, str(result[key]))
                     writer.write("%s = %s\n" % (key, str(result[key])))
