@@ -178,13 +178,12 @@ def main():
                     "total batch size=%d\n" % args.batch_size)
                 writer.write("train num epochs = %d\n" % args.epochs)
                 writer.write("max seq length = %d\n" % args.max_seq_length)
-                for i in range(n_labels):
-                    logger.info("****************************")
-                    logger.info("class {}".format(ID2CLASS[i]))
-                    result = test_output_scores[i]
-                    for key in sorted(result.keys()):
-                        logger.info("  %s = %s", key, str(result[key]))
-                        writer.write("%s = %s\n" % (key, str(result[key])))
+                logger.info("****************************")
+                logger.info("class {}".format(ID2CLASS[no_class]))
+                result = test_output_scores[no_class]
+                for key in sorted(result.keys()):
+                    logger.info("  %s = %s", key, str(result[key]))
+                    writer.write("%s = %s\n" % (key, str(result[key])))
 
         logger.info('Best f1:')
         logger.info(best_f1)
