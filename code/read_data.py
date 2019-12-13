@@ -6,8 +6,8 @@ from pytorch_transformers import *
 import torch.utils.data as Data
 
 
-def get_data(data_path, max_seq_len, model='xlnet-base-cased'):
-    tokenizer = XLNetTokenizer.from_pretrained(model)
+def get_data(data_path, max_seq_len, tokenizer):
+    tokenizer = XLNetTokenizer.from_pretrained(tokenizer)
 
     with open(data_path + 'labeled_data.pkl', 'rb') as f:
         labeled_data = pickle.load(f)
