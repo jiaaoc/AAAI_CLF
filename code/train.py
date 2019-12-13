@@ -86,6 +86,7 @@ def main():
         os.mkdir(args.output_dir)
     # config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     # tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
+    model_name = "xlnet-base-cased"
     tokenizer = XLNetTokenizer.from_pretrained("xlnet-base-cased")
 
     train_labeled_set, val_set, test_set, n_labels = get_data(args.data_path, args.max_seq_length, tokenizer)
@@ -172,7 +173,7 @@ def main():
             output_eval_file = os.path.join(args.output_dir, "results.txt")
             with open(output_eval_file, "a") as writer:
                 logger.info("***** Eval results {} *****")
-                writer.write("model = %s\n" % str(args.model_name_or_path))
+                writer.write("model = %s\n" % str(model_name))
                 writer.write(
                     "total batch size=%d\n" % args.batch_size)
                 writer.write("train num epochs = %d\n" % args.epochs)
