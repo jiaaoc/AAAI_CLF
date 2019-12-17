@@ -24,7 +24,7 @@ parser.add_argument('--epochs', default=50, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--batch_size', default=32, type=int, metavar='N',
                     help='train batchsize')
-parser.add_argument('--batch_size_u', default=24, type=int, metavar='N',
+parser.add_argument('--batch_size_u', default=96, type=int, metavar='N',
                     help='train batchsize')
 
 parser.add_argument('--max_seq_length', default=64, type=int, metavar='N',
@@ -35,7 +35,7 @@ parser.add_argument('--lrmain', '--learning-rate-bert', default=0.00001, type=fl
 parser.add_argument('--lrlast', '--learning-rate-model', default=0.001, type=float,
                     metavar='LR', help='initial learning rate for models')
 
-parser.add_argument('--gpu', default='1,2,3,4', type=str,
+parser.add_argument('--gpu', default='5,6', type=str,
                     help='id(s) for CUDA_VISIBLE_DEVICES')
 parser.add_argument('--output_dir', default="test_model", type=str,
                     help='path to trained model and eval and test results')
@@ -47,6 +47,8 @@ parser.add_argument('--data-path', type=str, default='./processed_data/',
                     help='path to data folders')
 parser.add_argument("--do_lower_case", action='store_true',
                     help="Set this flag if you are using an uncased model.")
+parser.add_argument("--uda", action='store_true',
+                    help="Set this flag if uda.")
 parser.add_argument("--weight_decay", default=0.0, type=float,
                     help="Weight deay if we apply some.")
 parser.add_argument("--adam_epsilon", default=1e-8, type=float,
@@ -55,6 +57,10 @@ parser.add_argument('--average', type=str, default='macro',
                     help='pos_label or macro for 0/1 classes')
 parser.add_argument("--warmup_steps", default=100, type=int,
                         help="Linear warmup over warmup_steps.")
+parser.add_argument("--lam", default=1.0, type=float,
+                    help="lam for uda loss.")
+parser.add_argument("--no_class", default=0, type=int,
+                    help="number of class.")
 args = parser.parse_args()
 
 
@@ -79,40 +85,67 @@ def print_score(output_scores, no_class):
     for key in sorted(result.keys()):
         logger.info("  %s = %s", key, str(result[key]))
 
+def cycle(iterable):
+    while True:
+        for i in iterable:
+            yield i
 
 def main():
     global best_f1
     if not os.path.exists(args.output_dir):
         os.mkdir(args.output_dir)
     # config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+
+    # if "uncased" in args.model_name_or_path:
+    #     args.do_lower_case = True
+    # else:
+    #     args.do_lower_case = False
+
     # tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
     model_name = "xlnet-base-cased"
-    tokenizer = XLNetTokenizer.from_pretrained("xlnet-base-cased")
+    tokenizer = XLNetTokenizer.from_pretrained(model_name)
+    # model_name = args.model_name_or_path
+    no_class = args.no_class
 
-    train_labeled_set, val_set, test_set, n_labels = get_data(args.data_path, args.max_seq_length, tokenizer)
+    train_labeled_set, train_unlabeled_set, train_unlabeled_aug_set, val_set, test_set, n_labels = \
+        get_data(args.data_path, args.max_seq_length, tokenizer, no_class)
+
     labeled_trainloader = Data.DataLoader(
         dataset=train_labeled_set, batch_size=args.batch_size, shuffle=True)
-    #unlabeled_trainloader = Data.DataLoader(
-    #    dataset=train_unlabeled_set, batch_size=args.batch_size_u, shuffle=True)
+
+    unlabeled_trainloader = Data.DataLoader(
+       dataset=train_unlabeled_set, batch_size=args.batch_size_u, shuffle=False)
+
+    unlabeled_aug_trainloader = Data.DataLoader(
+        dataset=train_unlabeled_set, batch_size=args.batch_size_u, shuffle=False)
+
+    unlabeled_trainloader = cycle(unlabeled_trainloader)
+
+    unlabeled_aug_trainloader = cycle(unlabeled_aug_trainloader)
+
     val_loader = Data.DataLoader(
         dataset=val_set, batch_size=512, shuffle=False)
+
     test_loader = Data.DataLoader(
         dataset=test_set, batch_size=512, shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = torch.cuda.device_count()
-
+    with_UDA = args.uda
+    lam = args.lam
     # Setup logging
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                         datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.INFO)
     logger.warning("Device: %s, n_gpu: %s", device, args.n_gpu)
-    # config = config_class.from_pretrained(args.model_name_or_path, num_labels=2)
-    # model = model_class.from_pretrained(args.model_name_or_path, config=config)
+
     n_labels = 2
-    no_class = 0
-    model = ClassificationXLNet(n_labels).cuda()
-    # model.to(device)
+    # config = config_class.from_pretrained(args.model_name_or_path, num_labels=n_labels)
+    # model = model_class.from_pretrained(args.model_name_or_path, config=config)
+    model = ClassificationXLNet(model_name, n_labels).cuda()
+    # model = ClassificationXLNet(model, n_labels).cuda()
+
+    model.to(device)
 
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
@@ -134,6 +167,7 @@ def main():
     #                                             num_training_steps=len(train_labeled_set))
 
     train_criterion = SemiLoss()
+    # consistency_criterion = nn.KLDivLoss(reduction='batchmean')
 
     all_test_f1 = []
     test_f1 = None
@@ -141,13 +175,17 @@ def main():
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(labeled_trainloader))
     logger.info("  Num Epochs = %d", args.epochs)
-    # logger.info("  Model = %s" % str(args.model_name_or_path))
+    logger.info("  Model = %s" % str(model_name))
+    logger.info("  Do lower case = %s" % str(args.do_lower_case))
+    logger.info("  UDA = %s" % str(with_UDA))
+    logger.info("  LAM = %s" % str(lam))
     # logger.info("  Lower case = %s" % str(args.do_lower_case))
     logger.info("  Batch size = %d" % args.batch_size)
     logger.info("  Max seq length = %d" % args.max_seq_length)
 
     for epoch in trange(args.epochs, ncols=50, desc="Epoch:"):
-        train(labeled_trainloader, model, optimizer, train_criterion, epoch, n_labels)
+        train(labeled_trainloader, unlabeled_trainloader, unlabeled_aug_trainloader,
+              model, optimizer, train_criterion, consistency_criterion, epoch, with_UDA, lam)
 
         train_output_scores, train_f1 = validate(labeled_trainloader,
                                                  model, n_labels, mode='Train Stats')
@@ -172,50 +210,81 @@ def main():
             logger.info("******Epoch {}, test score******".format(epoch))
             output_eval_file = os.path.join(args.output_dir, "results.txt")
             with open(output_eval_file, "a") as writer:
-                logger.info("***** Eval results {} *****")
+                # logger.info("***** Eval results {} *****")
                 writer.write("model = %s\n" % str(model_name))
                 writer.write(
                     "total batch size=%d\n" % args.batch_size)
                 writer.write("train num epochs = %d\n" % args.epochs)
                 writer.write("max seq length = %d\n" % args.max_seq_length)
-                logger.info("****************************")
+                writer.write("  Model = %s" % str(model_name))
+                writer.write("  UDA = %s" % str(with_UDA))
+                writer.write("  LAM = %s" % str(lam))
                 logger.info("class {}".format(ID2CLASS[no_class]))
                 result = test_output_scores
                 for key in sorted(result.keys()):
                     logger.info("  %s = %s", key, str(result[key]))
                     writer.write("%s = %s\n" % (key, str(result[key])))
 
-        logger.info('Best f1:')
-        logger.info(best_f1)
+            logger.info("Saving best model checkpoint to %s", args.output_dir)
+            # Save a trained model, configuration and tokenizer using `save_pretrained()`.
+            # They can then be reloaded using `from_pretrained()`
+            # model_to_save = model.module if hasattr(model,
+            #                                         'module') else model  # Take care of distributed/parallel training
+            # model_to_save.save_pretrained(args.output_dir)
+            # tokenizer.save_pretrained(args.output_dir)
+            model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
+            # output_model_file = os.path.join(args.output_dir, "pytorch_model.bin")
+            # torch.save(model_to_save.state_dict(), output_model_file)
+            torch.save(model_to_save.state_dict(), os.path.join(args.output_dir, 'best_model.bin'))
+            # Good practice: save your training arguments together with the trained model
+            torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
 
-        logger.info('Test f1:')
-        logger.info(test_f1)
+        logger.info('Best dev f1:{}; Test f1: {}'.format(best_f1, test_f1))
 
-    logger.info('Best f1:')
-    logger.info(best_f1)
+    logger.info('Best dev f1:{}; Test f1: {}'.format(best_f1, test_f1))
 
-    logger.info('Test f1:')
-    logger.info(test_f1)
 
-def train(labeled_trainloader, model, optimizer,criterion, epoch, n_labels):
+def train(labeled_trainloader, unlabeled_trainloader, unlabeled_aug_trainloader,
+          model, optimizer, criterion, consistency_criterion, epoch, with_UDA, lam):
     model.train()
 
     for batch_idx, (inputs , targets) in enumerate(labeled_trainloader):
         inputs, targets = inputs.cuda(),targets.cuda(non_blocking=True)
-        outputs = model(inputs)
+        # print("input: ", inputs)
+        # print("tgt: ", targets)
+        # outputs = model(inputs)
         # batch, targets = tuple(t.to(device) for t in inputs), targets.to(device)
         # inputs = {'input_ids': batch[0],
         #           'attention_mask': batch[1],
         #           'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
         #           XLM don't use segment_ids
-                  # }
-        # outputs = model(**inputs)
+        #           }
+        outputs = model(inputs)
         # outputs = outputs[0]
         # print("outputs: ", outputs.shape)
         # print("targets: ", targets.shape)
         # print(len(outputs))
         # print(outputs)
         loss = criterion(outputs, targets, epoch)
+
+        if with_UDA:
+            unsup_x, unsup_aug_x = next(unlabeled_trainloader), next(unlabeled_aug_trainloader)
+            unsup_x = unsup_x.cuda(non_blocking=True)
+            unsup_aug_x = unsup_aug_x.cuda(non_blocking=True)
+            # with torch.no_grad():
+            unsup_orig_y_pred = model(unsup_x).detach()
+            unsup_orig_y_probas = torch.softmax(unsup_orig_y_pred, dim=-1)
+
+            unsup_aug_y_pred = model(unsup_aug_x)
+            unsup_aug_y_probas = torch.log_softmax(unsup_aug_y_pred, dim=-1)
+
+            consistency_loss = consistency_criterion(unsup_aug_y_probas, unsup_orig_y_probas)
+
+        final_loss = loss
+
+        if with_UDA:
+            uda_loss = lam * consistency_loss
+            final_loss += uda_loss
         # print("outputs: ", outputs[0])
         # print("targets: ", targets[0])
         # outputs = torch.sigmoid(outputs)
@@ -230,9 +299,13 @@ def train(labeled_trainloader, model, optimizer,criterion, epoch, n_labels):
 
         optimizer.zero_grad()
         if batch_idx % 50 == 1:
-            print('\nepoch {}, step {}, loss {}'.format(
-                epoch, batch_idx, loss.item()))
-        loss.backward()
+            if with_UDA:
+                print('\nepoch {}, step {}, loss_total {}, uda_loss {}, mse_loss {}'.format(
+                    epoch, batch_idx, final_loss.item(), uda_loss.item(), loss.item()))
+            else:
+                print('\nepoch {}, step {}, loss_total {}'.format(
+                    epoch, batch_idx, final_loss.item()))
+        final_loss.backward()
         optimizer.step()
         # scheduler.step()
 
@@ -254,7 +327,8 @@ def validate(val_loader, model, n_labels, mode):
             #           'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
                       # XLM don't use segment_ids
                       # }
-            # outputs = model(**inputs)
+            # logits = model(**inputs)[0]
+            # logits = model(inputs)
             # outputs = torch.sigmoid(outputs[0])
             # outputs = torch.sigmoid(outputs)
             # outputs = np.argmax(outputs, axis=1)
@@ -276,13 +350,22 @@ def validate(val_loader, model, n_labels, mode):
 
     n_class = 2
     averaging = args.average
-    logger.info("averaging method: {}".format(averaging))
+    # logger.info("averaging method: {}".format(averaging))
 
     precision, recall, f1 = [], [], []
     for j in range(n_class):
-        p = correct_total[j] / predict_dict[j]
-        r = correct_total[j] / correct_dict[j]
-        f = 2 * p * r / (p + r)
+        if predict_dict[j] == 0:
+            p = 0
+        else:
+            p = correct_total[j] / predict_dict[j]
+        if correct_dict[j] == 0:
+            r = 0
+        else:
+            r = correct_total[j] / correct_dict[j]
+        if p+r == 0:
+            f = 0
+        else:
+            f = 2 * p * r / (p + r)
         precision.append(p)
         recall.append(r)
         f1.append(f)
@@ -308,7 +391,10 @@ class SemiLoss(object):
 
     def __call__(self, outputs_x, targets_x, epoch):
         loss_fct = CrossEntropyLoss()
+        # print("output_x: ", outputs_x.shape)
+        # print("targets_x: ", targets_x.shape)
         loss = loss_fct(outputs_x.view(-1, self.n_labels), targets_x.view(-1))
+
         return loss
         # Lx = - torch.mean(torch.sum(F.logsigmoid(outputs_x) * targets_x, dim=1))
         # return Lx

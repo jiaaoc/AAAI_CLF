@@ -45,6 +45,9 @@ de2en = de2en.cuda()
 
 for key, value in tqdm(train_unlabeled_data.items(), ncols=50, desc="Iteration:"):
     new_value = []
+    if cnt <= 69000:
+        cnt += 1
+        continue
     for i in range(num_sample_sen):
         v = de2en.translate(en2de.translate(value[1], sampling = True, temperature = 0.8),
                                     sampling = True, temperature = 0.8)
