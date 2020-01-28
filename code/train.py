@@ -12,15 +12,16 @@ from torch.autograd import Variable
 from torch.utils.data import Dataset
 import logging
 from read_data import *
-from model import ClassificationXLNet
+from model import ClassificationXLNet, ClassificationBERT
 from utils import ALL_MODELS, ID2CLASS, MODEL_CLASSES
 from transformers import AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm, trange
 from torch.nn import CrossEntropyLoss, MSELoss
 
+
 logger = logging.getLogger(__name__)
 parser = argparse.ArgumentParser(description='AAAI CLF')
-parser.add_argument('--epochs', default=50, type=int, metavar='N',
+parser.add_argument('--epochs', default=20, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--batch_size', default=32, type=int, metavar='N',
                     help='train batchsize')
@@ -45,8 +46,11 @@ parser.add_argument('--output_dir', default="test_model", type=str,
 #                     help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS))
 parser.add_argument('--data-path', type=str, default='./processed_data/',
                     help='path to data folders')
-parser.add_argument("--do_lower_case", action='store_true',
+
+
+parser.add_argument("--tsa", action='store_true',
                     help="Set this flag if you are using an uncased model.")
+
 parser.add_argument("--uda", action='store_true',
                     help="Set this flag if uda.")
 parser.add_argument("--weight_decay", default=0.0, type=float,
@@ -59,8 +63,18 @@ parser.add_argument("--warmup_steps", default=100, type=int,
                         help="Linear warmup over warmup_steps.")
 parser.add_argument("--lam", default=1.0, type=float,
                     help="lam for uda loss.")
+parser.add_argument("--lambda_u", default=1.0, type=float,
+                    help="lambda_u for consistent loss.")
+parser.add_argument("--T", default=1.0, type=float,
+                    help="T for sharpening.")
 parser.add_argument("--no_class", default=0, type=int,
                     help="number of class.")
+parser.add_argument('--margin', default=0.7, type=float, metavar='N',
+                    help='margin for hinge loss')
+parser.add_argument('--tsa_type', type=str, default='exp',
+                    help='tsa type')
+parser.add_argument('--model_name', type=str, default='xlnet-base-cased')
+
 args = parser.parse_args()
 
 
@@ -94,16 +108,20 @@ def main():
     global best_f1
     if not os.path.exists(args.output_dir):
         os.mkdir(args.output_dir)
-    # config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    
+    model_name = args.model_name #"xlnet-base-cased"
+    if "uncased" in model_name:
+        args.do_lower_case = True
+    else:
+        args.do_lower_case = False
+    
+    if "xlnet" in model_name:
+        tokenizer = XLNetTokenizer.from_pretrained(model_name, do_lower_case=args.do_lower_case)
+    elif "bert" in model_name:
+        tokenizer = BertTokenizer.from_pretrained(model_name, do_lower_case=args.do_lower_case)
+    else:
+        raise ValueError()
 
-    # if "uncased" in args.model_name_or_path:
-    #     args.do_lower_case = True
-    # else:
-    #     args.do_lower_case = False
-
-    # tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
-    model_name = "xlnet-base-cased"
-    tokenizer = XLNetTokenizer.from_pretrained(model_name)
     # model_name = args.model_name_or_path
     no_class = args.no_class
 
@@ -140,10 +158,12 @@ def main():
     logger.warning("Device: %s, n_gpu: %s", device, args.n_gpu)
 
     n_labels = 2
-    # config = config_class.from_pretrained(args.model_name_or_path, num_labels=n_labels)
-    # model = model_class.from_pretrained(args.model_name_or_path, config=config)
-    model = ClassificationXLNet(model_name, n_labels).cuda()
-    # model = ClassificationXLNet(model, n_labels).cuda()
+    if "xlnet" in model_name:
+        model = ClassificationXLNet(model_name, n_labels).cuda()
+    elif "bert" in model_name:
+        model = ClassificationBERT(model_name, n_labels).cuda()
+    else:
+        raise ValueError()
 
     model.to(device)
 
@@ -152,25 +172,15 @@ def main():
 
     optimizer = AdamW(
     [
-        {"params": model.module.xlnet.parameters(), "lr": args.lrmain},
+        {"params": model.module.transformer.parameters(), "lr": args.lrmain},
         {"params": model.module.linear.parameters(), "lr": args.lrlast},
     ])
-    # Prepare optimizer and schedule (linear warmup and decay)
-    # no_decay = ['bias', 'LayerNorm.weight']
-    # optimizer_grouped_parameters = [
-    #     {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-    #      'weight_decay': args.weight_decay},
-    #     {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-    # ]
-    # optimizer = AdamW(optimizer_grouped_parameters, lr=args.lrmain, eps=args.adam_epsilon)
-    # scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
-    #                                             num_training_steps=len(train_labeled_set))
 
-    train_criterion = SemiLoss()
-    # consistency_criterion = nn.KLDivLoss(reduction='batchmean')
+    train_criterion = SemiLoss(tsa_type = args.tsa_type)
 
     all_test_f1 = []
     test_f1 = None
+    best_f1 = 0
 
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(labeled_trainloader))
@@ -185,7 +195,7 @@ def main():
 
     for epoch in trange(args.epochs, ncols=50, desc="Epoch:"):
         train(labeled_trainloader, unlabeled_trainloader, unlabeled_aug_trainloader,
-              model, optimizer, train_criterion, consistency_criterion, epoch, with_UDA, lam)
+              model, optimizer, train_criterion, epoch, with_UDA, lam)
 
         train_output_scores, train_f1 = validate(labeled_trainloader,
                                                  model, n_labels, mode='Train Stats')
@@ -200,7 +210,7 @@ def main():
         logger.info("******Epoch {}, validation score******".format(epoch))
         print_score(val_output_scores, no_class)
         # print("epoch {}, val f1 {}".format(epoch, val_f1))
-
+        # for i in range(6):
         if val_f1 >= best_f1:
             best_f1 = val_f1
             test_output_scores, test_f1 = validate(test_loader, model, n_labels, mode = 'Test')
@@ -216,9 +226,9 @@ def main():
                     "total batch size=%d\n" % args.batch_size)
                 writer.write("train num epochs = %d\n" % args.epochs)
                 writer.write("max seq length = %d\n" % args.max_seq_length)
-                writer.write("  Model = %s" % str(model_name))
-                writer.write("  UDA = %s" % str(with_UDA))
-                writer.write("  LAM = %s" % str(lam))
+                writer.write("  Model = %s\n" % str(model_name))
+                writer.write("  UDA = %s\n" % str(with_UDA))
+                writer.write("  LAM = %s\n" % str(lam))
                 logger.info("class {}".format(ID2CLASS[no_class]))
                 result = test_output_scores
                 for key in sorted(result.keys()):
@@ -235,78 +245,80 @@ def main():
             model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
             # output_model_file = os.path.join(args.output_dir, "pytorch_model.bin")
             # torch.save(model_to_save.state_dict(), output_model_file)
-            torch.save(model_to_save.state_dict(), os.path.join(args.output_dir, 'best_model.bin'))
+#             torch.save(model_to_save.state_dict(), os.path.join(args.output_dir,
+#                                                                 'best_model_{}.bin'.format(ID2CLASS[no_class])))
             # Good practice: save your training arguments together with the trained model
-            torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
-
+#             torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
         logger.info('Best dev f1:{}; Test f1: {}'.format(best_f1, test_f1))
 
     logger.info('Best dev f1:{}; Test f1: {}'.format(best_f1, test_f1))
 
 
 def train(labeled_trainloader, unlabeled_trainloader, unlabeled_aug_trainloader,
-          model, optimizer, criterion, consistency_criterion, epoch, with_UDA, lam):
+          model, optimizer, criterion, epoch, with_UDA, lam):
     model.train()
 
-    for batch_idx, (inputs , targets) in enumerate(labeled_trainloader):
+    for batch_idx, (inputs , targets, sen_in) in enumerate(labeled_trainloader):
         inputs, targets = inputs.cuda(),targets.cuda(non_blocking=True)
-        # print("input: ", inputs)
-        # print("tgt: ", targets)
-        # outputs = model(inputs)
-        # batch, targets = tuple(t.to(device) for t in inputs), targets.to(device)
-        # inputs = {'input_ids': batch[0],
-        #           'attention_mask': batch[1],
-        #           'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
-        #           XLM don't use segment_ids
-        #           }
-        outputs = model(inputs)
-        # outputs = outputs[0]
-        # print("outputs: ", outputs.shape)
-        # print("targets: ", targets.shape)
-        # print(len(outputs))
-        # print(outputs)
-        loss = criterion(outputs, targets, epoch)
+        outputs = model(inputs, sen_in)
 
         if with_UDA:
-            unsup_x, unsup_aug_x = next(unlabeled_trainloader), next(unlabeled_aug_trainloader)
+            (_, (unsup_x, sen_ux)), ((unsup_aug_x, sen_uax),  (unsup_aug_x2, sen_uax2)) = next(unlabeled_trainloader), next(unlabeled_aug_trainloader)
             unsup_x = unsup_x.cuda(non_blocking=True)
             unsup_aug_x = unsup_aug_x.cuda(non_blocking=True)
-            # with torch.no_grad():
-            unsup_orig_y_pred = model(unsup_x).detach()
-            unsup_orig_y_probas = torch.softmax(unsup_orig_y_pred, dim=-1)
+            unsup_aug_x2 = unsup_aug_x2.cuda(non_blocking=True)
+            sen_ux = sen_ux.cuda(non_blocking=True)
+            sen_uax = sen_uax.cuda(non_blocking=True)
+            sen_uax2 = sen_uax2.cuda(non_blocking=True)
 
-            unsup_aug_y_pred = model(unsup_aug_x)
-            unsup_aug_y_probas = torch.log_softmax(unsup_aug_y_pred, dim=-1)
+            with torch.no_grad():
+                orig_y_pred = model(unsup_x, sen_ux)#.detach()
+                orig_y_probas = torch.softmax(orig_y_pred, dim=-1)
+                aug_y_pred = model(unsup_aug_x, sen_uax)#.detach()
+                aug_y_pred2 = model(unsup_aug_x2, sen_uax2)
+                # print("org: ", orig_y_probas[0])
+                p = (torch.softmax(aug_y_pred, dim=1) + torch.softmax(aug_y_pred2, dim=1) + orig_y_probas) / 3
+                #p = orig_y_probas
+                # print("aug1: ", torch.softmax(aug_y_pred,dim=1)[0])
+                # print("aug2: ", torch.softmax(aug_y_pred2,dim=1)[0])
 
-            consistency_loss = consistency_criterion(unsup_aug_y_probas, unsup_orig_y_probas)
+                pt = p ** (1 / args.T)
+                targets_u = pt / pt.sum(dim=1, keepdim=True)
+                # print("tgt: ", targets_u[0])
+                # input()
+                #targets_u = targets_u.detach()
 
-        final_loss = loss
+            if args.T != 1:
+                aug_y_pred = model(torch.cat([unsup_x, unsup_aug_x, unsup_aug_x2], dim = 0),
+                                   torch.cat([sen_ux, sen_uax, sen_uax2], dim = 0))
+                # print(aug_y_pred[0])
 
-        if with_UDA:
-            uda_loss = lam * consistency_loss
-            final_loss += uda_loss
-        # print("outputs: ", outputs[0])
-        # print("targets: ", targets[0])
-        # outputs = torch.sigmoid(outputs)
-        # print("o: ", outputs[0])
-        # id_1, id_0 = torch.where(outputs > 0.5), torch.where(outputs < 0.5)
-        # outputs[id_1] = 1
-        # outputs[id_0] = 0
-        # outputs = outputs.detach().cpu().numpy()
-        # targets = targets.to('cpu').numpy()
-        # print("outputs: ", outputs[:20, 0])
-        # print("targets: ", targets[:20, 0])
+                targets_u = torch.cat([targets_u, targets_u, targets_u], dim=0)
+
+            # p = (torch.softmax(outputs_u, dim=1) + torch.softmax(outputs_u2, dim=1) + 1 * torch.softmax(outputs_ori,
+            #                                                                                             dim=1)) / 3
+
+            # unsup_aug_y_probas = torch.log_softmax(unsup_aug_y_pred, dim=-1)
+
+            # consistency_loss = consistency_criterion(unsup_aug_y_probas, unsup_orig_y_probas)
+            loss = criterion(outputs, targets, aug_y_pred, targets_u, aug_y_pred, epoch+batch_idx/len(labeled_trainloader))
+            total_loss = loss[0]
+            # weight = args.lambda_u * linear_rampup(epoch)
+        else:
+            loss = criterion(outputs, targets, epoch)
+            total_loss = loss
 
         optimizer.zero_grad()
         if batch_idx % 50 == 1:
             if with_UDA:
                 print('\nepoch {}, step {}, loss_total {}, uda_loss {}, mse_loss {}'.format(
-                    epoch, batch_idx, final_loss.item(), uda_loss.item(), loss.item()))
+                    epoch, batch_idx, loss[0], loss[2], loss[1]))
             else:
                 print('\nepoch {}, step {}, loss_total {}'.format(
-                    epoch, batch_idx, final_loss.item()))
-        final_loss.backward()
+                    epoch, batch_idx, loss))
+        total_loss.backward()
         optimizer.step()
+        # break
         # scheduler.step()
 
 def validate(val_loader, model, n_labels, mode):
@@ -318,20 +330,9 @@ def validate(val_loader, model, n_labels, mode):
 
     outputs = None
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(val_loader):
-            inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
-            logits = model(inputs)
-            # batch, targets = tuple(t.to(device) for t in inputs), targets.to(device)
-            # inputs = {'input_ids': batch[0],
-            #           'attention_mask': batch[1],
-            #           'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
-                      # XLM don't use segment_ids
-                      # }
-            # logits = model(**inputs)[0]
-            # logits = model(inputs)
-            # outputs = torch.sigmoid(outputs[0])
-            # outputs = torch.sigmoid(outputs)
-            # outputs = np.argmax(outputs, axis=1)
+        for batch_idx, (inputs, targets, sen_score) in enumerate(val_loader):
+            inputs, targets, sen_score = inputs.cuda(), targets.cuda(non_blocking=True), sen_score.cuda()
+            logits = model(inputs, sen_score) # (bsz, 6, 2)
             if outputs is None:
                 outputs = logits.detach().cpu().numpy()
                 out_label_ids = targets.detach().cpu().numpy()
@@ -339,7 +340,7 @@ def validate(val_loader, model, n_labels, mode):
                 outputs = np.append(outputs, logits.detach().cpu().numpy(), axis=0)
                 out_label_ids = np.append(out_label_ids, targets.detach().cpu().numpy(), axis=0)
 
-    pred = np.argmax(outputs, axis=1)
+    pred = np.argmax(outputs, axis=-1)
     batch_size = pred.shape[0]
     for b in range(batch_size):
         predict_dict[int(pred[b])] += 1
@@ -347,12 +348,15 @@ def validate(val_loader, model, n_labels, mode):
         if pred[b] == out_label_ids[b]:
             correct_total[int(pred[b])] += 1
     acc = simple_accuracy(pred, out_label_ids)
-
+    print("c_dict: ", correct_dict)
     n_class = 2
     averaging = args.average
     # logger.info("averaging method: {}".format(averaging))
 
-    precision, recall, f1 = [], [], []
+    precision = []
+    recall = []
+    f1 = []
+
     for j in range(n_class):
         if predict_dict[j] == 0:
             p = 0
@@ -366,10 +370,10 @@ def validate(val_loader, model, n_labels, mode):
             f = 0
         else:
             f = 2 * p * r / (p + r)
+
         precision.append(p)
         recall.append(r)
         f1.append(f)
-
 
     if averaging == "pos_label":
         p, r, f = precision[1], recall[1], f1[1]
@@ -380,22 +384,76 @@ def validate(val_loader, model, n_labels, mode):
         raise ValueError("UnsupportedOperationException")
 
     output_scores = {"precision":p, "recall":r, "f1":f, "acc":acc}
+
     output_f1 = f
 
     return output_scores, output_f1
 
 
-class SemiLoss(object):
-    def __init__(self, n_labels=2):
-        self.n_labels = n_labels
+def TSA(epoch, n_class, tsa_type = 'exp'):
+    epoch = math.floor(epoch)/args.epochs
+    if tsa_type == 'exp':
+        return np.exp((epoch - 1) * 5) * (1-1/n_class) + 1/n_class
+    elif tsa_type == 'linear':
+        return epoch * (1- 1/n_class) + 1/n_class
+    elif tsa_type == 'log':
+        return (1-np.exp(-epoch * 5)) * (1-1/n_class) + 1/n_class
+    else:
+        return 1
 
-    def __call__(self, outputs_x, targets_x, epoch):
-        loss_fct = CrossEntropyLoss()
+
+def linear_rampup(current, rampup_length=args.epochs):
+    if rampup_length == 0:
+        return 1.0
+    else:
+        current = np.clip(current / rampup_length, 0.0, 1.0)
+        return float(current)
+
+
+class SemiLoss(object):
+    def __init__(self, n_labels=2, tsa_type = 'exp', weight=[1.0,1.0]):
+        self.n_labels = n_labels
+        self.weight = torch.tensor(weight).cuda()
+        self.loss_fct = CrossEntropyLoss(weight=self.weight)
+        self.tsa_type = tsa_type
+
+    def __call__(self, outputs_x, targets_x, outputs_u=None, targets_u=None, outputs_u_2=None, epoch=None):
         # print("output_x: ", outputs_x.shape)
         # print("targets_x: ", targets_x.shape)
-        loss = loss_fct(outputs_x.view(-1, self.n_labels), targets_x.view(-1))
+        loss = self.loss_fct(outputs_x.view(-1, self.n_labels), targets_x.view(-1))
 
-        return loss
+        if args.tsa:
+            thres = TSA(epoch, self.n_labels, self.tsa_type)
+            q_y_softmax = F.softmax(outputs_x, dim=1)
+            q_y_log_softmax = F.log_softmax(outputs_x, dim=1)
+            count = 0
+            classification_loss = 0
+            for i in range(outputs_x.shape[0]):
+                if q_y_softmax[i][targets_x[i].long()] < thres:
+                    classification_loss += (-1 * q_y_log_softmax[i][targets_x[i].long()])
+                    count += 1
+            if count > 0:
+                classification_loss = classification_loss / count
+            else:
+                classification_loss = 0
+            loss = classification_loss
+
+        if args.uda:
+            probs_u = torch.softmax(outputs_u, dim=1)
+            # print("prob_u: ", probs_u[0])
+            Lu = F.kl_div(probs_u.log(), targets_u, None, None, 'batchmean')
+            # Lu=F.mse_loss(probs_u, targets_u)
+            total_loss = loss + args.lambda_u * linear_rampup(epoch) * Lu
+            # Lu2 = torch.mean(torch.clamp(
+            #     torch.sum(-F.softmax(outputs_u_2, dim=1) * F.log_softmax(outputs_u_2, dim=1), dim=1) - args.margin,
+            #     min=0))
+            # total_loss += Lu2
+            final_loss = (total_loss, loss, args.lambda_u * linear_rampup(epoch) * Lu)
+        else:
+            final_loss = loss
+
+
+        return final_loss
         # Lx = - torch.mean(torch.sum(F.logsigmoid(outputs_x) * targets_x, dim=1))
         # return Lx
 

@@ -7,21 +7,39 @@ class ClassificationXLNet(nn.Module):
     def __init__(self, model_name, num_labels=2):
         super(ClassificationXLNet, self).__init__()
 
-        self.xlnet = XLNetModel.from_pretrained(model_name)
-        # self.transformer = transformer_model
+        self.transformer = XLNetModel.from_pretrained(model_name)
         self.max_pool = nn.MaxPool1d(64)
+        self.drop = nn.Dropout(0.3)
+        self.linear = nn.Sequential(nn.Linear(768+4, num_labels))
 
-        self.linear = nn.Linear(768, num_labels)
-
-    def forward(self, x):
+    def forward(self, x, sen_x):
         # print("x: ", x.shape)
-        all_hidden, pooler = self.xlnet(x)
-        # outputs = self.transformer(**x)
-        # all_hidden = outputs[0]
-        # print("allh: ", all_hidden.shape)
+        # all_hidden, pooler = self.xlnet(x)
+        all_hidden, pooler = self.transformer(x)
+        pooled_output = torch.mean(all_hidden, 1)
+        sen_output = torch.cat([pooled_output, sen_x], dim=-1)
+        
+        predict = self.linear(sen_output)
+        predict = self.drop(predict)
 
-        pooled_output = self.max_pool(all_hidden.transpose(1, 2))
-        pooled_output = pooled_output.squeeze(2)
+        return predict
 
-        predict = self.linear(pooled_output)
+    
+class ClassificationBERT(nn.Module):
+    def __init__(self, model_name, num_labels=2):
+        super(ClassificationBERT, self).__init__()
+        
+        self.transformer = BertModel.from_pretrained(model_name)
+        self.max_pool = nn.MaxPool1d(64)
+        self.drop = nn.Dropout(0.3)
+        self.linear = nn.Sequential(nn.Linear(768+4, num_labels))
+
+    def forward(self, x, sen_x):
+        all_hidden, pooler = self.transformer(x)
+        pooled_output = torch.mean(all_hidden, 1)
+        sen_output = torch.cat([pooled_output, sen_x], dim=-1)
+        
+        predict = self.linear(sen_output)
+        predict = self.drop(predict)
+
         return predict
